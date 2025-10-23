@@ -153,21 +153,21 @@ class Qwen2VLProcessor(ProcessorMixin):
             # Process each audio sample 
             processed_audios = []
 
-            for audio in audios:
+            for audio in audios: # (273920,) numpy array of 16000 Hz audio ~ 17.12s
                 # Pad/trim to 30 seconds
-                trimmed_audio = whisper.pad_or_trim(audio)
+                trimmed_audio = whisper.pad_or_trim(audio) # (480000,) numpy array of 16000 Hz audio ~ 30s
 
                 # Convert to mel spectrogram
-                mel_spectrogram = whisper.log_mel_spectrogram(trimmed_audio, n_mels=128)
+                mel_spectrogram = whisper.log_mel_spectrogram(trimmed_audio, n_mels=128) # torch.Size([128, 3000]) https://github.com/openai/whisper/blob/main/whisper/audio.py#L100 80 or 128  -> 80 if optimizing for speech + efficiency, 128 if for richer features for multimodal models or music.
                 
                 processed_audios.append(mel_spectrogram)
                 audio_lengths.append(mel_spectrogram.shape[-1])  # Time dimension
 
             # Stack all audio features
             if processed_audios:
-                audio_features = torch.stack(processed_audios)  # [num_audios, n_mels, time]
-                audio_inputs['audio_values'] = audio_features  # ← Changed to 'audio_values'
-                audio_inputs["audio_grid_thw"] = torch.tensor([[1, 1, length] for length in audio_lengths])
+                audio_features = torch.stack(processed_audios)  # [num_audios, n_mels, time] torch.Size([1, 128, 3000])
+                audio_inputs['audio_values'] = audio_features   
+                audio_inputs["audio_grid_thw"] = torch.tensor([[1, 1, length] for length in audio_lengths]) # 3D spatial/temporal grid structure of the audio features, following the same pattern used for images and videos in Qwen2-VL.
 
                 
 
@@ -199,17 +199,16 @@ class Qwen2VLProcessor(ProcessorMixin):
         if audios is not None:
             audio_token = "<|audio_pad|>"
             index = 0
-            for i in range(len(text)):
+            for i in range(len(text)): # '<|im_start|>system\nYou are an automatic speech recognition assistant.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.<|im_end|>\n<|im_start|>assistant\n'
                 while audio_token in text[i]:
-                    # each audio gets it full length tokens (no merging for audio)
-                    num_audio_tokens = audio_lengths[index]
-                    text[i] = text[i].replace(audio_token, "<|placeholder|>" * num_audio_tokens, 1)
+                    num_audio_tokens = audio_lengths[index] # 3000
+                    text[i] = text[i].replace(audio_token, "<|placeholder|>" * num_audio_tokens, 1) # replace audio_token with 3000 placeholder tokens '<|im_start|>system\nYou are an automatic speech recognition assistant.<|im_end|>\n<|im_start|>user\n<|audio_start|><|placeholder|>X3000<|audio_end|>'
                     index += 1
-                text[i] = text[i].replace("<|placeholder|>", audio_token)
+                text[i] = text[i].replace("<|placeholder|>", audio_token) # replace placeholder tokens with audio_token '<|im_start|>system\nYou are an automatic speech recognition assistant.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.<|im_end|>\n<|im_start|>assistant\n'
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", False)
-        text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"], return_tensors=None)
+        text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"], return_tensors=None) # 3028 tokens
         self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video", "audio"])
 
         if return_mm_token_type_ids:

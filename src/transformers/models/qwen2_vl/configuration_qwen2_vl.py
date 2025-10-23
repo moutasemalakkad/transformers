@@ -56,6 +56,15 @@ class Qwen2VLVisionConfig(PretrainedConfig):
         self.initializer_range = initializer_range
 
 
+class Qwen2VLAudioConfig(PretrainedConfig):
+    model_type = "qwen2_vl_audio"
+
+    def __init__(self, whisper_model_name="turbo", projection_dim=2048, freeze_whisper=True, **kwargs):
+        super().__init__(**kwargs)
+        self.whisper_model_name = whisper_model_name
+        self.projection_dim = projection_dim
+        self.freeze_whisper = freeze_whisper
+
 class Qwen2VLTextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen2VLTextModel`]. It is used to instantiate a
@@ -289,15 +298,17 @@ class Qwen2VLConfig(PretrainedConfig):
     ```"""
 
     model_type = "qwen2_vl"
-    sub_configs = {"vision_config": Qwen2VLVisionConfig, "text_config": Qwen2VLTextConfig}
+    sub_configs = {"vision_config": Qwen2VLVisionConfig, "text_config": Qwen2VLTextConfig, "audio_config": Qwen2VLAudioConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
         text_config=None,
         vision_config=None,
+        audio_config=None,
         image_token_id=151655,
         video_token_id=151656,
+        audio_token_id=151657,
         vision_start_token_id=151652,
         vision_end_token_id=151653,
         **kwargs,
@@ -318,8 +329,18 @@ class Qwen2VLConfig(PretrainedConfig):
             # For BC use all kwargs to init `TextConfig`
             self.text_config = self.sub_configs["text_config"](**kwargs)
 
+        # Audio config - create default if not provided
+        if isinstance(audio_config, dict):
+            self.audio_config = self.sub_configs["audio_config"](**audio_config)
+        elif audio_config is None:
+            # CRITICAL FIX: Create default audio config instead of None
+            self.audio_config = self.sub_configs["audio_config"]()
+        else:
+            self.audio_config = audio_config
+
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
+        self.audio_token_id = audio_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
 
@@ -348,4 +369,4 @@ class Qwen2VLConfig(PretrainedConfig):
         return super().__getattribute__(key)
 
 
-__all__ = ["Qwen2VLConfig", "Qwen2VLTextConfig"]
+__all__ = ["Qwen2VLConfig", "Qwen2VLTextConfig", "Qwen2VLAudioConfig", "Qwen2VLVisionConfig"]
