@@ -58,13 +58,10 @@ class Qwen2VLVisionConfig(PretrainedConfig):
 
 class Qwen2VLAudioConfig(PretrainedConfig):
     model_type = "qwen2_vl_audio"
-
-    def __init__(self, whisper_model_name="turbo", projection_dim=2048, freeze_whisper=True, **kwargs):
-        super().__init__(**kwargs)
-        self.whisper_model_name = whisper_model_name
-        self.projection_dim = projection_dim
-        self.freeze_whisper = freeze_whisper
-
+    whisper_model_name: str = "turbo"
+    embed_dim: int = 1280
+    hidden_size: int = 3584
+    
 class Qwen2VLTextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen2VLTextModel`]. It is used to instantiate a

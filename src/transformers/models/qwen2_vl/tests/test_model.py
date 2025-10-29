@@ -1,11 +1,9 @@
-
-
-"""
-Test the modified Qwen2-VL processor with audio support
-"""
-from transformers import Qwen2VLProcessor
+import torch
+import whisper
+from transformers import Qwen2VLAudioConfig, Qwen2VLProcessor
 from datasets import load_dataset
 from qwen_vl_utils import fetch_audio
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2AudioTransformerPretrainedModel
 
 
 def format_as_chatml(sample, include_assistant=True):
@@ -76,34 +74,26 @@ print(f"✓ Template applied\n")
 
 # Step 6: Process with audio
 print("Step 6: Processing text + audio through processor...")
-try:
-    inputs = processor(
-        text=[text],
-        audios=[audio_array],
-        return_tensors="pt",
-        padding=False,
-        truncation=False
-    )
-    
-    print("✓ Processor output keys:", list(inputs.keys()))
-    print(f"✓ Input IDs shape: {inputs['input_ids'].shape}")
-    
-    if 'audio_values' in inputs:
-        print(f"✓ Audio values shape: {inputs['audio_values'].shape}")
-        print(f"✓ Audio grid thw: {inputs['audio_grid_thw']}")
-        
-        # Verify audio tokens
-        audio_pad_id = processor.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
-        num_audio_tokens = (inputs['input_ids'] == audio_pad_id).sum().item()
-        print(f"✓ Found {num_audio_tokens} audio pad tokens in input")
-        print(f"  (Expected ~1500 for 30-second audio)")
-        
-        print(f"\n✓ Expected transcription: {sample['text']}")
-    else:
-        print("\n⚠️  WARNING: 'audio_values' not in outputs!")
-        print("Available keys:", list(inputs.keys()))
-    
-except Exception as e:
-    print(f"Error in audio processor: {e}")
-    import traceback
-    traceback.print_exc()
+inputs = processor(
+    text=[text],
+    audios=[audio_array],
+    return_tensors="pt",
+    padding=False,
+    truncation=False
+)
+
+print(inputs['input_ids'])
+print(f"✓ Processed. Input keys: {list(inputs.keys())}\n")
+
+# Step 7: Test audio model with audio_values from processor
+print("Step 7: Testing audio model...")
+config = Qwen2VLAudioConfig(whisper_model_name="turbo")
+audio_model = Qwen2AudioTransformerPretrainedModel(config)
+
+# Use audio_values from processor (already contains mel spectrograms)
+audio_values = inputs['audio_values']  # Shape: [batch_size, n_mels, time] torch.Size([1, 128, 3000])
+print(f"Audio values shape from processor: {audio_values.shape}")
+
+# Pass to audio model (handles batched input automatically) Shape:[batch_size, time, embed_dim] torch.Size([1, 1500, 3584]) 
+output = audio_model(audio_values)
+print(f"✓ Audio model output shape: {output.shape}")

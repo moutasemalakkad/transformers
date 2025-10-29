@@ -48,7 +48,8 @@ from ...utils.deprecation import deprecate_kwarg
 from ..qwen2.modeling_qwen2 import (
     Qwen2RMSNorm,
 )
-from .configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
+from .configuration_qwen2_vl import Qwen2VLAudioConfig, Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
+import whisper
 
 
 logger = logging.get_logger(__name__)
@@ -638,6 +639,28 @@ class Qwen2VLPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
 
+@auto_docstring
+class Qwen2AudioTransformerPretrainedModel(Qwen2VLPreTrainedModel):
+    config: Qwen2VLAudioConfig
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.model = whisper.load_model(config.whisper_model_name)
+        self.proj = nn.Linear(config.embed_dim, config.hidden_size)
+    
+    def forward(self, mel_spectrogram):
+        # mel_spectrogram shape: [batch_size, n_mels, time] or [n_mels, time]
+        if mel_spectrogram.dim() == 2:
+            # Add batch dimension if not present
+            mel_spectrogram = mel_spectrogram.unsqueeze(0)
+        
+        # Process through Whisper encoder
+        x = self.model.encoder(mel_spectrogram)
+        x = self.proj(x)
+        return x
+
+
 
 @auto_docstring
 class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
@@ -905,6 +928,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         super().__init__(config)
         self.visual = Qwen2VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2VLTextModel._from_config(config.text_config)
+        self.audio = Qwen2AudioTransformerPretrainedModel._from_config(config.audio_config)
         self.rope_deltas = None  # cache rope_deltas here
 
         # Initialize weights and apply final processing
@@ -1111,6 +1135,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         inputs_embeds: torch.FloatTensor,
         image_features: Optional[torch.FloatTensor] = None,
         video_features: Optional[torch.FloatTensor] = None,
+        audio_features: Optional[torch.FloatTensor] = None,
     ):
         """
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
@@ -1142,8 +1167,16 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             raise ValueError(
                 f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
             )
+        
+        special_audio_mask = input_ids == self.config.audio_token_id
+        n_audio_tokens = special_audio_mask.sum()
+        special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if audio_features is not None and inputs_embeds[special_audio_mask].numel() != audio_features.numel():
+            raise ValueError(
+                f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {audio_features.shape[0]}"
+            )
 
-        return special_image_mask, special_video_mask
+        return special_image_mask, special_video_mask, special_audio_mask
 
     @auto_docstring
     def forward(
@@ -1161,6 +1194,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        audio_values: Optional[torch.FloatTensor] = None,
+        audio_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1198,6 +1233,14 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if audio_values is not None:
+            audio_embeds = self.audio(audio_values)
+            _, audio_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, audio_features=audio_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
+
 
         if position_ids is None:
             if self.rope_deltas is None or cache_position is None or cache_position[0] == 0:
