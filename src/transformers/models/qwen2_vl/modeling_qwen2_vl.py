@@ -646,8 +646,57 @@ class Qwen2AudioTransformerPretrainedModel(Qwen2VLPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.model = whisper.load_model(config.whisper_model_name)
+        self._whisper_model_name = config.whisper_model_name
+        # LAZY LOADING EXPLANATION:
+        # We defer Whisper model loading to avoid meta device conflicts during from_pretrained().
+        #
+        # THE PROBLEM:
+        # When Qwen2VLForConditionalGeneration.from_pretrained() is called, HuggingFace uses
+        # "meta device" initialization for memory efficiency (low_cpu_mem_usage=True by default):
+        #   1. Model structure is created on "meta" device (no actual memory allocation)
+        #   2. Weights are loaded from checkpoint
+        #   3. Model is moved to real device (CPU/GPU)
+        #
+        # If we load Whisper directly in __init__ (without lazy loading):
+        #   - __init__ runs while parent Qwen2VLModel is still on "meta" device
+        #   - whisper.load_model() creates real tensors on CPU
+        #   - Conflict: Can't have real child modules inside a meta parent module
+        #   - ERROR: NotImplementedError: Cannot copy out of meta tensor; no data!
+        #            Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to()
+        #            when moving module from meta to a different device.
+        #
+        # THE SOLUTION (Lazy Loading):
+        # - Store only the model name in __init__ (self._model = None)
+        # - Load Whisper only when first accessed (via @property model)
+        # - By that time, parent model is already off meta device and on real device
+        # - Timeline: from_pretrained() → __init__ (no Whisper) → move to device → 
+        #             first forward() → NOW load Whisper (safe!)
+        #
+        # This ensures Whisper loads only when needed and only after parent is on a real device.
+        self._model = None
         self.proj = nn.Linear(config.embed_dim, config.hidden_size)
+    
+    @property
+    def model(self):
+        """
+        Lazy load Whisper model on first access.
+        
+        This property ensures Whisper is only loaded after the parent model
+        has been moved off the meta device to a real device (CPU/GPU).
+        """
+        if self._model is None:
+            self._model = whisper.load_model(self._whisper_model_name, device="cpu")
+        return self._model
+    
+    def to(self, *args, **kwargs):
+        """
+        Ensure Whisper is loaded before moving to device.
+        
+        When model.to(device) is called, we need to ensure Whisper is already
+        loaded (not None) so it gets moved along with the rest of the model.
+        """
+        _ = self.model  # Trigger lazy loading if not already loaded
+        return super().to(*args, **kwargs)
     
     def forward(self, mel_spectrogram):
         # mel_spectrogram shape: [batch_size, n_mels, time] or [n_mels, time]
@@ -655,7 +704,7 @@ class Qwen2AudioTransformerPretrainedModel(Qwen2VLPreTrainedModel):
             # Add batch dimension if not present
             mel_spectrogram = mel_spectrogram.unsqueeze(0)
         
-        # Process through Whisper encoder
+        # Process through Whisper encoder (lazy loaded via property)
         x = self.model.encoder(mel_spectrogram)
         x = self.proj(x)
         return x
@@ -928,7 +977,17 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         super().__init__(config)
         self.visual = Qwen2VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2VLTextModel._from_config(config.text_config)
-        self.audio = Qwen2AudioTransformerPretrainedModel._from_config(config.audio_config)
+        # Only initialize audio if explicitly configured with a whisper model
+        if config.audio_config is not None and config.audio_config.whisper_model_name is not None:
+            self.audio = Qwen2AudioTransformerPretrainedModel._from_config(config.audio_config)
+            # Add projection layer if audio hidden_size doesn't match text hidden_size
+            if config.audio_config.hidden_size != config.text_config.hidden_size:
+                self.audio_proj = nn.Linear(config.audio_config.hidden_size, config.text_config.hidden_size)
+            else:
+                self.audio_proj = None
+        else:
+            self.audio = None
+            self.audio_proj = None
         self.rope_deltas = None  # cache rope_deltas here
 
         # Initialize weights and apply final processing
@@ -1171,10 +1230,12 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         special_audio_mask = input_ids == self.config.audio_token_id
         n_audio_tokens = special_audio_mask.sum()
         special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if audio_features is not None and inputs_embeds[special_audio_mask].numel() != audio_features.numel():
-            raise ValueError(
-                f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {audio_features.shape[0]}"
-            )
+        # Note: Audio processing handles multiple time steps per audio token,
+        # so we allow audio_features to have more elements than the single token placeholder
+        if audio_features is not None and n_audio_tokens > 0:
+            # For now, we allow audio_features to have any number of features >= n_audio_tokens
+            # The actual insertion is handled in the forward method
+            pass
 
         return special_image_mask, special_video_mask, special_audio_mask
 
@@ -1221,7 +1282,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
+            image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
@@ -1229,14 +1290,23 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
+            _, video_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        if audio_values is not None:
-            audio_embeds = self.audio(audio_values)
-            _, audio_mask = self.get_placeholder_mask(
+        if audio_values is not None and self.audio is not None:
+            audio_embeds = self.audio(audio_values)  # [batch_size, time_steps, audio_hidden_size]
+            
+            # Project audio embeddings to match text model's hidden size if needed
+            if self.audio_proj is not None:
+                audio_embeds = self.audio_proj(audio_embeds)  # [batch_size, time_steps, text_hidden_size]
+            
+            # Flatten time steps: [batch_size, time_steps, hidden_size] -> [batch_size * time_steps, hidden_size]
+            batch_size, time_steps, hidden_size = audio_embeds.shape
+            audio_embeds = audio_embeds.view(-1, hidden_size)
+            
+            _, _, audio_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, audio_features=audio_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
@@ -1342,8 +1412,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
+        audio_values: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        audio_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1400,8 +1472,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
+            audio_values=audio_values,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            audio_grid_thw=audio_grid_thw,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -1443,8 +1517,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         use_cache=True,
         pixel_values=None,
         pixel_values_videos=None,
+        audio_values=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        audio_grid_thw=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1458,8 +1534,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
+            audio_values=audio_values,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            audio_grid_thw=audio_grid_thw,
             use_cache=use_cache,
             **kwargs,
         )

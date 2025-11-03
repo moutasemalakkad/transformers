@@ -58,9 +58,18 @@ class Qwen2VLVisionConfig(PretrainedConfig):
 
 class Qwen2VLAudioConfig(PretrainedConfig):
     model_type = "qwen2_vl_audio"
-    whisper_model_name: str = "turbo"
-    embed_dim: int = 1280
-    hidden_size: int = 3584
+    
+    def __init__(
+        self,
+        whisper_model_name=None,
+        embed_dim=1280,
+        hidden_size=3584,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.whisper_model_name = whisper_model_name
+        self.embed_dim = embed_dim
+        self.hidden_size = hidden_size
     
 class Qwen2VLTextConfig(PretrainedConfig):
     r"""
@@ -326,12 +335,12 @@ class Qwen2VLConfig(PretrainedConfig):
             # For BC use all kwargs to init `TextConfig`
             self.text_config = self.sub_configs["text_config"](**kwargs)
 
-        # Audio config - create default if not provided
+        # Audio config - create empty config if not provided (optional component)
         if isinstance(audio_config, dict):
             self.audio_config = self.sub_configs["audio_config"](**audio_config)
         elif audio_config is None:
-            # CRITICAL FIX: Create default audio config instead of None
-            self.audio_config = self.sub_configs["audio_config"]()
+            # Create an empty audio config - whisper_model_name will be None
+            self.audio_config = self.sub_configs["audio_config"](whisper_model_name=None)
         else:
             self.audio_config = audio_config
 

@@ -161,7 +161,9 @@ class Qwen2VLProcessor(ProcessorMixin):
                 mel_spectrogram = whisper.log_mel_spectrogram(trimmed_audio, n_mels=128) # torch.Size([128, 3000]) https://github.com/openai/whisper/blob/main/whisper/audio.py#L100 80 or 128  -> 80 if optimizing for speech + efficiency, 128 if for richer features for multimodal models or music.
                 
                 processed_audios.append(mel_spectrogram)
-                audio_lengths.append(mel_spectrogram.shape[-1])  # Time dimension
+                # Whisper encoder downsamples time dimension by 2x, so output length is input_length // 2
+                output_length = mel_spectrogram.shape[-1] // 2  # 3000 -> 1500
+                audio_lengths.append(output_length)  # Output time dimension after Whisper encoder
 
             # Stack all audio features
             if processed_audios:
