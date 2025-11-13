@@ -63,7 +63,7 @@ class Qwen2VLAudioConfig(PretrainedConfig):
         self,
         whisper_model_name=None,
         embed_dim=1280,
-        hidden_size=3584,
+        hidden_size=1536, # 3584
         **kwargs
     ):
         super().__init__(**kwargs)

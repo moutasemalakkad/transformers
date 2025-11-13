@@ -91,9 +91,9 @@ config = Qwen2VLAudioConfig(whisper_model_name="turbo")
 audio_model = Qwen2AudioTransformerPretrainedModel(config)
 
 # Use audio_values from processor (already contains mel spectrograms)
-audio_values = inputs['audio_values']  # Shape: [batch_size, n_mels, time] torch.Size([1, 128, 3000])
-print(f"Audio values shape from processor: {audio_values.shape}")
+audio_values = inputs['audio_values']  # Shape: [batch_size, n_mels, time] 
+print(f"Audio values shape from processor: {audio_values.shape}") # torch.Size([1, 128, 3000])
 
-# Pass to audio model (handles batched input automatically) Shape:[batch_size, time, embed_dim] torch.Size([1, 1500, 3584]) 
+# Pass to audio model (handles batched input automatically) Shape:[batch_size, time, embed_dim]  
 output = audio_model(audio_values)
-print(f"✓ Audio model output shape: {output.shape}")
+print(f"✓ Audio model output shape: {output.shape}") # torch.Size([1, 1500, 1280])

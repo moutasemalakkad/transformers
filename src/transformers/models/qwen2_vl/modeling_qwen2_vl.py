@@ -647,7 +647,7 @@ class Qwen2AudioTransformerPretrainedModel(Qwen2VLPreTrainedModel):
         super().__init__(config)
         self.config = config
         self._whisper_model_name = config.whisper_model_name
-        # LAZY LOADING EXPLANATION:
+        # LAZY LOADING:
         # We defer Whisper model loading to avoid meta device conflicts during from_pretrained().
         #
         # THE PROBLEM:
@@ -674,29 +674,51 @@ class Qwen2AudioTransformerPretrainedModel(Qwen2VLPreTrainedModel):
         #
         # This ensures Whisper loads only when needed and only after parent is on a real device.
         self._model = None
-        self.proj = nn.Linear(config.embed_dim, config.hidden_size)
+        #self.proj = nn.Linear(config.embed_dim, config.hidden_size)
     
     @property
     def model(self):
         """
         Lazy load Whisper model on first access.
-        
+
         This property ensures Whisper is only loaded after the parent model
         has been moved off the meta device to a real device (CPU/GPU).
         """
         if self._model is None:
+            # Always load on CPU first (safest approach)
             self._model = whisper.load_model(self._whisper_model_name, device="cpu")
+
+            # Move to parent device if not on meta
+            if self.device.type != 'meta':
+                self._model = self._model.to(device=self.device, dtype=self.dtype)
         return self._model
+
+    @property
+    def dtype(self):
+        """Get dtype from parent's parameters"""
+        try:
+            return next(self.parameters()).dtype
+        except StopIteration:
+            return torch.float32  # Fallback
     
     def to(self, *args, **kwargs):
         """
-        Ensure Whisper is loaded before moving to device.
-        
-        When model.to(device) is called, we need to ensure Whisper is already
-        loaded (not None) so it gets moved along with the rest of the model.
+        Ensure Whisper is moved to the correct device when parent moves.
+
+        When model.to(device) is called, we need to:
+        1. Move parent module first (which will move self.proj and other components)
+        2. Move Whisper to match (if already loaded)
+           (self._model is not a registered submodule, so super().to() doesn't move it)
         """
-        _ = self.model  # Trigger lazy loading if not already loaded
-        return super().to(*args, **kwargs)
+        # Move parent module first
+        result = super().to(*args, **kwargs)
+
+        # Now move Whisper to match (if loaded)
+        # Use the same args/kwargs to handle both device and dtype changes
+        if self._model is not None and self.device.type != 'meta':
+            self._model = self._model.to(*args, **kwargs)
+
+        return result
     
     def forward(self, mel_spectrogram):
         # mel_spectrogram shape: [batch_size, n_mels, time] or [n_mels, time]
@@ -704,9 +726,17 @@ class Qwen2AudioTransformerPretrainedModel(Qwen2VLPreTrainedModel):
             # Add batch dimension if not present
             mel_spectrogram = mel_spectrogram.unsqueeze(0)
         
-        # Process through Whisper encoder (lazy loaded via property)
-        x = self.model.encoder(mel_spectrogram)
-        x = self.proj(x)
+        # Ensure Whisper is on the same device as input (safety check)
+        input_device = mel_spectrogram.device
+        whisper_model = self.model  # Trigger lazy loading if needed
+        if whisper_model is not None:
+            whisper_device = next(whisper_model.parameters()).device
+            if whisper_device != input_device:
+                self._model = whisper_model.to(input_device)
+        
+        # Process through Whisper encoder
+        x = self._model.encoder(mel_spectrogram)
+        #x = self.proj(x)
         return x
 
 
@@ -1295,20 +1325,50 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+        # ===================================================================
+        # AUDIO PROCESSING: Convert audio signals to embeddings and insert
+        # them into the input sequence to replace <|audio_pad|> tokens
+        # ===================================================================
         if audio_values is not None and self.audio is not None:
+            # Step 1: Encode audio mel spectrograms into embeddings
+            # audio_values: [batch_size, n_mels, time_steps] - mel spectrograms from processor
+            # audio_embeds: [batch_size, time_steps, audio_hidden_size] - encoded audio features
+            #   - Uses Whisper encoder (loaded lazily via self.audio.model)
+            #   - Whisper downsamples time dimension by 2x (3000 -> 1500 time steps)
+            #   - Each time step represents ~20ms of audio
             audio_embeds = self.audio(audio_values)  # [batch_size, time_steps, audio_hidden_size]
             
-            # Project audio embeddings to match text model's hidden size if needed
+            # Step 2: Project audio embeddings to match language model's hidden dimension
+            # Whisper encoder outputs 3584-dim embeddings, but Qwen2-VL text model expects 1536-dim
+            # This linear projection aligns the dimensions so audio can be processed by the LM
             if self.audio_proj is not None:
                 audio_embeds = self.audio_proj(audio_embeds)  # [batch_size, time_steps, text_hidden_size]
             
-            # Flatten time steps: [batch_size, time_steps, hidden_size] -> [batch_size * time_steps, hidden_size]
+            # Step 3: Ensure audio embeddings are on the same device and dtype as input embeddings
+            # This is critical for masked_scatter to work correctly (must match device/dtype)
+            audio_embeds = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            
+            # Step 4: Flatten audio embeddings for masked_scatter operation
+            # masked_scatter expects a 1D source tensor, so we flatten from:
+            #   [batch_size, time_steps, hidden_size] -> [batch_size * time_steps, hidden_size]
+            # Then we'll flatten completely to [batch_size * time_steps * hidden_size] in masked_scatter
             batch_size, time_steps, hidden_size = audio_embeds.shape
             audio_embeds = audio_embeds.view(-1, hidden_size)
             
+            # Step 5: Get mask indicating where audio tokens (<|audio_pad|>) are in the input sequence
+            # The processor creates 1500 consecutive <|audio_pad|> tokens (one per audio time step)
+            # audio_mask: [batch_size, seq_len, hidden_size] boolean mask marking audio token positions
+            #   - True values indicate positions where audio embeddings should be inserted
+            #   - Should have exactly 1500 * 1536 = 2,304,000 True positions (1500 tokens × 1536 dims)
             _, _, audio_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, audio_features=audio_embeds
             )
+            
+            # Step 6: Insert audio embeddings into input embeddings at mask positions
+            # masked_scatter replaces the placeholder token embeddings with actual audio embeddings
+            # This happens BEFORE the forward pass, so audio embeddings flow through all transformer layers
+            # Result: Audio features are integrated with text/vision at the embedding level
+            # Note: masked_scatter flattens both tensors internally, so audio_embeds [N, hidden_size] works
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
 
 
